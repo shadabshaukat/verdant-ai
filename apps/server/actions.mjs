@@ -1,6 +1,7 @@
+import { shutdownController } from "./lifecycle.mjs";
 import { shouldEscalateExpiredAction } from "./control-flow.mjs";
 import { desiredState, precondition } from "./evidence.mjs";
-import { pools, errText } from "./config.mjs";
+import { pools, errText, WORKER_ID } from "./config.mjs";
 import { db, transaction, event, policy as readPolicy } from "./store.mjs";
 import { ACTION_SPECS, validateProposal, needsApproval } from "./policy.mjs";
 import {
@@ -32,7 +33,11 @@ export async function proposeAction({
   reason,
   inspected,
   runId,
+  proposedBy = "ollama",
 }) {
+  if (!["ollama", "openai", "bedrock", "oci"].includes(proposedBy))
+    throw new Error("Unknown planner provider");
+  if (shutdownController.signal.aborted) return { status: "stopping" };
   const p = await readPolicy();
   const spec = validateProposal({ tool, incident, inspected, policy: p });
   if (typeof reason !== "string" || reason.length < 5 || reason.length > 1000)
@@ -52,7 +57,7 @@ export async function proposeAction({
     const key = incident.incident_id + ":" + incident.generation + ":" + tool;
     let row = (
       await c.query(
-        `INSERT INTO agent.action(incident_id,generation,target_id,idempotency_key,tool,title,status,risk,reason,before_evidence,proposed_by,sql_template) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'ollama',$11) ON CONFLICT(idempotency_key) DO NOTHING RETURNING *`,
+        `INSERT INTO agent.action(incident_id,generation,target_id,idempotency_key,tool,title,status,risk,reason,before_evidence,proposed_by,sql_template) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(idempotency_key) DO NOTHING RETURNING *`,
         [
           incident.incident_id,
           incident.generation,
@@ -64,6 +69,7 @@ export async function proposeAction({
           spec.risk,
           reason,
           currentEvidence,
+          proposedBy,
           spec.sql,
         ],
       )
@@ -113,10 +119,27 @@ export async function proposeAction({
     title: spec.title,
   };
 }
+async function deferForShutdown(id, runId) {
+  await transaction(async (c) => {
+    await c.query(
+      "UPDATE agent.action SET status='queued',claimed_until=NULL,attempts=greatest(0,attempts-1) WHERE action_id=$1 AND status='running' AND claimed_by=$2",
+      [id, WORKER_ID],
+    );
+    await event(
+      "action.deferred",
+      "Shutdown deferred an undispatched action",
+      { targetWriteExecuted: false },
+      { actionId: id, runId },
+      c,
+    );
+  });
+  return { status: "stopping", actionId: id };
+}
 export async function executeAction(id, runId = null) {
+  if (shutdownController.signal.aborted) return { status: "stopping" };
   const p = await readPolicy();
   if (p.paused) return { status: "paused", actionId: id };
-  const owner = process.env.HOSTNAME || "local-worker";
+  const owner = WORKER_ID;
   const action = await transaction(async (c) => {
     await c.query(
       "SELECT pg_advisory_xact_lock(hashtext('verdant-action-budget'))",
@@ -157,6 +180,7 @@ export async function executeAction(id, runId = null) {
         message: "Desired state already observed. No second target write.",
       };
     } else {
+      if (shutdownController.signal.aborted) return deferForShutdown(id, runId);
       const freshPolicy = await readPolicy();
       if (freshPolicy.paused)
         throw new Error("Operator paused actions before execution");
@@ -226,6 +250,7 @@ export async function executeAction(id, runId = null) {
       );
       const pool =
         spec.target === "standby" ? pools.STANDBY_ACTION : pools.PRIMARY_ACTION;
+      if (shutdownController.signal.aborted) return deferForShutdown(id, runId);
       execution = { result: (await pool.query(spec.sql)).rows };
     }
     let after;

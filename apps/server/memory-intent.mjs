@@ -45,9 +45,11 @@ export function parseMemoryIntent(body = {}, now = Date.now()) {
     "keyword",
     "limit",
     "offset",
+    "clusterId",
   ]);
   if (Object.keys(body).some((k) => !allowed.has(k)))
     fail("Unsupported search field");
+  if (body.clusterId != null && body.clusterId !== "demo" && (typeof body.clusterId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.clusterId))) fail("clusterId must be demo or a cluster UUID");
   if (body.query != null && typeof body.query !== "string")
     fail("Query must be text");
   const query = (body.query || "").trim();
@@ -198,6 +200,7 @@ export function parseMemoryIntent(body = {}, now = Date.now()) {
     (categories.length > 0 || keywords.length > 0 || !lexicalText);
   return {
     query,
+    clusterId: body.clusterId || null,
     from,
     to,
     keywords: [...new Set(keywords)],

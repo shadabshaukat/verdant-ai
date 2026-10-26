@@ -1,4 +1,5 @@
-import { pools, timestamp } from "./config.mjs";
+import { initialPolicySettings } from "./environment.mjs";
+import { pools, timestamp, ENV } from "./config.mjs";
 import { DEFAULT_POLICY, normalizePolicy } from "./policy.mjs";
 export const db = pools.CONTROL;
 export async function transaction(fn) {
@@ -78,6 +79,29 @@ export async function changePolicy(body) {
     return next;
   });
 }
+export async function initializePolicyDefaults() {
+  return transaction(async (c) => {
+    const current = (
+      await c.query("SELECT value FROM agent.policy WHERE singleton FOR UPDATE")
+    ).rows[0]?.value;
+    if (!current)
+      throw new Error(
+        "Control policy is missing; apply schema migrations first",
+      );
+    const hasHistory = (
+      await c.query(
+        "SELECT EXISTS(SELECT 1 FROM agent.event) OR EXISTS(SELECT 1 FROM agent.observation) OR EXISTS(SELECT 1 FROM agent.action) AS present",
+      )
+    ).rows[0].present;
+    const initial = initialPolicySettings(current, { hasHistory }, ENV);
+    if (!hasHistory)
+      await c.query(
+        "UPDATE agent.policy SET value=$1,updated_at=now() WHERE singleton",
+        [initial],
+      );
+    return initial;
+  });
+}
 export async function requestCycle() {
   await db.query(
     "UPDATE agent.runtime SET cycle_requested_at=now() WHERE singleton",
@@ -138,7 +162,7 @@ export async function recall(incidents, limit = 8) {
   const ids = incidents.map((x) => x.incident_id);
   const kinds = incidents.map((x) => x.kind);
   const r = await db.query(
-    `SELECT * FROM agent.memory WHERE incident_id=ANY($1::uuid[]) OR metadata->>'incidentKind'=ANY($2::text[]) OR search @@ websearch_to_tsquery('english',$3) OR kind='human_directive' ORDER BY CASE WHEN kind IN ('human_feedback','human_directive') THEN 0 ELSE 1 END,created_at DESC LIMIT $4`,
+    `SELECT m.* FROM agent.memory m LEFT JOIN agent.incident i USING(incident_id) WHERE (m.incident_id=ANY($1::uuid[]) OR m.metadata->>'incidentKind'=ANY($2::text[]) OR m.search @@ websearch_to_tsquery('english',$3) OR m.kind='human_directive') AND (i.target_id IN ('primary','standby') OR (m.incident_id IS NULL AND coalesce(m.metadata->>'scope','')<>'fleet')) ORDER BY CASE WHEN m.kind IN ('human_feedback','human_directive') THEN 0 ELSE 1 END,m.created_at DESC LIMIT $4`,
     [ids, kinds, kinds.join(" "), limit],
   );
   let semantic = [];
@@ -161,7 +185,7 @@ export async function recall(incidents, limit = 8) {
 export async function activeIncidents() {
   return (
     await db.query(
-      `SELECT * FROM agent.incident WHERE status<>'resolved' ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,first_seen_at`,
+      `SELECT * FROM agent.incident WHERE status<>'resolved' AND target_id IN ('primary','standby') ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,first_seen_at`,
     )
   ).rows;
 }
@@ -269,7 +293,7 @@ export async function reviewIncident(incident, reason, runId) {
     return r;
   });
 }
-export async function submitReview(id, decision, feedback) {
+export async function submitReview(id, decision, feedback, actor = "operator") {
   if (!["approve", "reject", "complete"].includes(decision))
     throw Object.assign(
       new Error("Decision must be approve, reject or complete"),
@@ -309,8 +333,8 @@ export async function submitReview(id, decision, feedback) {
           : "completed";
     const next = (
       await c.query(
-        `UPDATE agent.review SET status=$2,feedback=$3,reviewed_by='conference-operator',completed_at=now() WHERE review_id=$1 RETURNING *`,
-        [id, status, feedback],
+        `UPDATE agent.review SET status=$2,feedback=$3,reviewed_by=$4,completed_at=now() WHERE review_id=$1 RETURNING *`,
+        [id, status, feedback, actor],
       )
     ).rows[0];
     if (r.action_id && r.review_type === "approval")

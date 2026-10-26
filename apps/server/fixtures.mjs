@@ -99,19 +99,44 @@ export async function setFixture(id, active = true) {
         });
         blocker.on("error", () => {});
         victim.on("error", () => {});
-        await blocker.connect();
-        await victim.connect();
-        await blocker.query("BEGIN");
-        await blocker.query(
-          "UPDATE app.orders SET updated_at=updated_at WHERE id=1",
-        );
-        const close = async () => {
-          sessions.delete(id);
-          await Promise.allSettled([blocker.end(), victim.end()]);
-          await db.query(
-            `UPDATE agent.demo_fixture SET active=false,expires_at=NULL WHERE fixture_id=$1`,
-            [id],
+        try {
+          await blocker.connect();
+          await victim.connect();
+          await blocker.query("BEGIN");
+          await blocker.query(
+            "UPDATE app.orders SET updated_at=updated_at WHERE id=1",
           );
+        } catch (error) {
+          await Promise.allSettled([blocker.end(), victim.end()]);
+          throw error;
+        }
+        let closing, timer;
+        const reportCloseError = (error) =>
+          console.error(
+            JSON.stringify({
+              component: "fixture-cleanup",
+              error: errText(error),
+            }),
+          );
+        const close = () => {
+          if (closing) return closing;
+          closing = (async () => {
+            clearTimeout(timer);
+            try {
+              await Promise.allSettled([blocker.end(), victim.end()]);
+              await pools.PRIMARY_DEMO.query(
+                "SELECT ops.set_fixture_flag($1,false)",
+                [id],
+              );
+              await db.query(
+                "UPDATE agent.demo_fixture SET active=false,expires_at=NULL WHERE fixture_id=$1",
+                [id],
+              );
+            } finally {
+              sessions.delete(id);
+            }
+          })();
+          return closing;
         };
         sessions.set(id, { close });
         void blocker
@@ -120,9 +145,11 @@ export async function setFixture(id, active = true) {
           .catch(() => {});
         void victim
           .query("UPDATE app.orders SET updated_at=updated_at WHERE id=1")
-          .then(() => close())
-          .catch(() => close());
-        const timer = setTimeout(close, 91000);
+          .then(close, close)
+          .catch(reportCloseError);
+        timer = setTimeout(() => {
+          void close().catch(reportCloseError);
+        }, 91000);
         timer.unref();
         await pools.PRIMARY_DEMO.query("SELECT ops.set_fixture_flag($1,true)", [
           "blocked-query",

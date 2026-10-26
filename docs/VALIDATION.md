@@ -1,5 +1,24 @@
 # Validation record
 
+## Fleet platform — 26 October 2026
+
+Validated locally on Apple Silicon with Linux ARM64 Docker containers. The configured host runtime and unit tests passed; the repository CI matrix targets Node 22/24 on Linux, macOS and Windows, but those remote runners were not used to make the local claims below.
+
+- **92 unit tests and repository checks passed.** Coverage includes configuration, private-file setup, immutable migration checksums, access roles/session security, credential encryption, native provider requests/signatures, fleet TLS, counter reset semantics, scoped retrieval, bootstrap delimiter injection, and maintenance guards.
+- **Retained-data upgrade passed.** All seven migrations applied to the existing control store without replacing credentials or deleting history. Its 18 existing action receipts remained; memories/events increased from the pre-upgrade baseline as new validation outcomes were recorded.
+- **Fresh deployment passed in both modes.** A production control plane started without scenario databases or demo inventory. The isolated fresh demo deployment then initialized new primary/standby volumes with private secret files and passed live replication, role and API integration checks. The isolated QA project was removed afterward.
+- **Migration behavior passed.** Reapplying a migrated store reported no pending migrations. A live isolated test with a modified copy of an applied SQL file was rejected by checksum verification before application migrations executed.
+- **Real PostgreSQL 14 and 18 monitoring passed.** A separate PostgreSQL 14.24 target had only an unrelated `business.accounts` schema, a non-administrative monitoring login and no `pg_stat_statements`. Optional statement metrics were unavailable; first transaction rate and unknown replication lag stayed null. Later samples measured a real transaction delta. This was a self-managed PG14 test; an `aws-rds` provider label did not turn it into a cloud service test.
+- **Fleet API and maintenance passed.** Tests exercised masked credential edits, capability probes, disabled SQL capture, failed-endpoint isolation, review/memory scoping, soft deletion and history retention. A completed investigation stayed single within the same incident generation while the unresolved finding remained open. A separate PG18 database verified exact-helper/table-allowlist enforcement, approval before target execution, actual `ANALYZE`, fresh verification, distinct approval/acknowledgement memories and idempotent review completion. Temporary databases and roles were removed.
+- **Real model onboarding and investigation passed.** The GUI saved, tested and activated Local Qwen (`qwen3:4b-instruct-2507-q4_K_M`). A real fleet run used `inspect_security → inspect_activity → inspect_replication → close_investigation`, completed in about 16.5 seconds, retained an explicitly unverified assessment, then persisted human feedback without resolving the measured condition. No external action was dispatched by this read-only investigation. Early failed native-close attempts remain recorded; compact evidence finalization fixed the observed completion path.
+- **Provider transport tests passed.** Official AWS Converse and OCI GENERIC SDKs serialized and signed requests against controlled transports. OpenAI-compatible HTTP/native-tool shapes, redirects, aborts and secret-safe diagnostics were checked. Live AWS/OCI/OpenAI account inference was not tested without credentials and entitlements.
+- **Retrieval and browser checks passed.** Actual 768-dimensional vectors obeyed mandatory date/category/literal filters and historical SQL provenance. Real global and Demo-scoped memory searches worked. The GUI expanded all 225 columns across 21 tables; desktop/mobile checks covered role controls, drawers, cluster selection and expired sessions. README screenshots use actual API data rather than fixture metrics.
+- **Dependency audit:** the installed production dependency graph reported zero known vulnerabilities at validation time.
+
+Model assessment remains unverified. One real query investigation made unsupported index assertions and misinterpreted an `ANALYZE` command's row count; the validation feedback explicitly rejected those claims. Measured dashboard facts and the maintenance executor do not derive authority from that prose. These checks do not establish universal cloud compatibility, a performance benchmark, high availability or production certification. See [production deployment](PRODUCTION.md) and [fleet limits](FLEET.md).
+
+## Earlier conference validation
+
 Validated on 24 October 2026 against the local Docker deployment, PostgreSQL 18.4 and native Ollama `qwen3:4b-instruct-2507-q4_K_M`. Results describe this disposable lab, not a production benchmark or a long-term reliability guarantee.
 
 ## Completed checks

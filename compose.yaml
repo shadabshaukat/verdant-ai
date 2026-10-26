@@ -1,19 +1,55 @@
-name: verdant-dba
+name: ${COMPOSE_PROJECT_NAME:-verdant-dba}
 
 x-agent-env: &agent-env
   PORT: "8090"
+  SERVER_HOST: "0.0.0.0"
   NODE_ENV: production
-  OLLAMA_URL: http://host.docker.internal:11434
-  OLLAMA_CHAT_MODEL: ${OLLAMA_MODEL:-qwen3:4b-instruct-2507-q4_K_M}
+  OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+  OLLAMA_CHAT_URL: ${OLLAMA_CHAT_URL:-}
+  OLLAMA_EMBED_URL: ${OLLAMA_EMBED_URL:-}
+  OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:4b-instruct-2507-q4_K_M}
+  OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-}
   OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text:v1.5}
   MONITOR_INTERVAL_SECONDS: ${MONITOR_INTERVAL_SECONDS:-15}
   PLANNER_TIMEOUT_MS: ${PLANNER_TIMEOUT_MS:-45000}
-  DEMO_ENABLED: "true"
+  PLANNER_CONTEXT_TOKENS: ${PLANNER_CONTEXT_TOKENS:-12288}
+  PLANNER_MAX_TOKENS: ${PLANNER_MAX_TOKENS:-300}
+  OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-30m}
+  EMBEDDING_TIMEOUT_MS: ${EMBEDDING_TIMEOUT_MS:-12000}
+  EMBEDDING_QUERY_TIMEOUT_MS: ${EMBEDDING_QUERY_TIMEOUT_MS:-5000}
+  SEMANTIC_RECALL_TIMEOUT_MS: ${SEMANTIC_RECALL_TIMEOUT_MS:-1200}
+  MEMORY_INDEX_INTERVAL_MS: ${MEMORY_INDEX_INTERVAL_MS:-15000}
+  MEMORY_INDEX_BATCH_SIZE: ${MEMORY_INDEX_BATCH_SIZE:-100}
+  MEMORY_EMBED_BATCH_SIZE: ${MEMORY_EMBED_BATCH_SIZE:-8}
+  DB_CONNECT_TIMEOUT_MS: ${DB_CONNECT_TIMEOUT_MS:-5000}
+  DB_QUERY_TIMEOUT_MS: ${DB_QUERY_TIMEOUT_MS:-10000}
+  DB_STATEMENT_TIMEOUT_MS: ${DB_STATEMENT_TIMEOUT_MS:-8000}
+  CONTROL_POOL_MAX: ${CONTROL_POOL_MAX:-8}
+  TARGET_POOL_MAX: ${TARGET_POOL_MAX:-4}
+  SHUTDOWN_TIMEOUT_MS: ${SHUTDOWN_TIMEOUT_MS:-10000}
+  DEMO_ENABLED: ${DEMO_ENABLED:-true}
+  VERDANT_CREDENTIAL_KEY_FILE: /run/secrets/credential_key
+  VERDANT_ADMIN_TOKEN_FILE: /run/secrets/admin_token
+  VERDANT_OPERATOR_TOKEN: ${VERDANT_OPERATOR_TOKEN:-}
+  VERDANT_VIEWER_TOKEN: ${VERDANT_VIEWER_TOKEN:-}
+  VERDANT_PUBLIC_URL: ${VERDANT_PUBLIC_URL:-}
+  VERDANT_COOKIE_SECURE: ${VERDANT_COOKIE_SECURE:-false}
+  VERDANT_SESSION_SECONDS: ${VERDANT_SESSION_SECONDS:-28800}
+  VERDANT_ALLOW_INSECURE_ENDPOINTS: ${VERDANT_ALLOW_INSECURE_ENDPOINTS:-false}
+  FLEET_MONITOR_INTERVAL_SECONDS: ${FLEET_MONITOR_INTERVAL_SECONDS:-30}
+  FLEET_HISTORY_DAYS: ${FLEET_HISTORY_DAYS:-14}
+  CONTROL_PASSWORD_FILE: /run/secrets/control_password
+  PRIMARY_PASSWORD_FILE: /run/secrets/monitor_password
+  STANDBY_PASSWORD_FILE: /run/secrets/monitor_password
+  PRIMARY_ACTION_PASSWORD_FILE: /run/secrets/executor_password
+  STANDBY_ACTION_PASSWORD_FILE: /run/secrets/executor_password
+  PRIMARY_DEMO_PASSWORD_FILE: /run/secrets/demo_password
+  STANDBY_DEMO_PASSWORD_FILE: /run/secrets/demo_password
 
 x-agent-service: &agent-service
   build: .
-  image: verdant-dba/app:1.1.1
-  entrypoint: ["/bin/sh", "/run-verdant-service.sh"]
+  image: ${APP_IMAGE:-verdant-dba/app:1.2.0}
+  user: "${APP_UID:-1000}:${APP_GID:-1000}"
   environment: *agent-env
   extra_hosts:
     - host.docker.internal:host-gateway
@@ -22,8 +58,8 @@ x-agent-service: &agent-service
     - monitor_password
     - executor_password
     - demo_password
-  volumes:
-    - ./scripts/run-service.sh:/run-verdant-service.sh:ro
+    - credential_key
+    - admin_token
   networks: [backend, frontend]
   depends_on:
     control: { condition: service_healthy }
@@ -31,6 +67,7 @@ x-agent-service: &agent-service
     standby: { condition: service_healthy }
     migrate: { condition: service_completed_successfully }
   restart: unless-stopped
+  stop_grace_period: 45s
   security_opt: [no-new-privileges:true]
   cap_drop: [ALL]
   logging:
@@ -51,34 +88,34 @@ services:
     secrets: [postgres_password, control_password]
     volumes:
       - control_data:/var/lib/postgresql
-      - ./scripts/control-init.sh:/docker-entrypoint-initdb.d/00-control.sh:ro
-      - ./db/control:/control-schema:ro
     networks: [backend]
     healthcheck:
-      test:
-        [
-          CMD-SHELL,
-          'pg_isready -U postgres -d verdant && psql -U postgres -d verdant -Atqc "SELECT to_regnamespace(''agent'') IS NOT NULL" | grep -q t',
-        ]
+      test: [CMD, pg_isready, -h, "127.0.0.1", -U, postgres, -d, verdant]
       interval: 3s
       timeout: 5s
       retries: 30
     restart: unless-stopped
 
   migrate:
-    image: verdant-dba/control:18.4-pgvector0.8.7
-    entrypoint: [/bin/sh, /control-migrate.sh]
-    secrets: [postgres_password]
-    volumes:
-      - ./scripts/control-migrate.sh:/control-migrate.sh:ro
-      - ./db/control:/control-schema:ro
+    build: .
+    image: ${APP_IMAGE:-verdant-dba/app:1.2.0}
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    command: [node, scripts/migrate.mjs]
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      CONTROL_PASSWORD_FILE: /run/secrets/control_password
+    secrets: [postgres_password, control_password]
     networks: [backend]
     depends_on:
       control: { condition: service_healthy }
     restart: "no"
 
   primary:
-    image: postgres:18.4-bookworm
+    build:
+      context: .
+      dockerfile: db/postgres/Dockerfile
+    image: verdant-dba/postgres:18.4
+    entrypoint: [/usr/local/bin/verdant-primary-entrypoint.sh]
     environment:
       POSTGRES_USER: postgres
       POSTGRES_DB: workload
@@ -110,7 +147,7 @@ services:
       ]
     volumes:
       - primary_data:/var/lib/postgresql
-      - ./db/primary:/docker-entrypoint-initdb.d:ro
+    tmpfs: [/run/verdant-postgres:mode=0700]
     networks: [backend]
     healthcheck:
       test:
@@ -125,14 +162,16 @@ services:
     restart: unless-stopped
 
   standby:
-    image: postgres:18.4-bookworm
+    build:
+      context: .
+      dockerfile: db/postgres/Dockerfile
+    image: verdant-dba/postgres:18.4
     environment:
       PGDATA: /var/lib/postgresql/18/docker
-    entrypoint: [/bin/sh, /standby-entrypoint.sh]
+    entrypoint: [/usr/local/bin/verdant-standby-entrypoint.sh]
     secrets: [replicator_password]
     volumes:
       - standby_data:/var/lib/postgresql
-      - ./db/standby/entrypoint.sh:/standby-entrypoint.sh:ro
     networks: [backend]
     depends_on:
       primary: { condition: service_healthy }
@@ -150,8 +189,14 @@ services:
 
   app:
     <<: *agent-service
-    command: [apps/server/server.mjs]
-    ports: ["127.0.0.1:${APP_PORT:-8090}:8090"]
+    command: [node, apps/server/server.mjs]
+    environment:
+      <<: *agent-env
+      SERVICE_ROLE: app
+    ports:
+      - target: 8090
+        published: "${APP_PORT:-8090}"
+        host_ip: "${APP_HOST:-127.0.0.1}"
     healthcheck:
       test:
         [
@@ -166,7 +211,10 @@ services:
 
   worker:
     <<: *agent-service
-    command: [apps/server/worker.mjs]
+    command: [node, apps/server/worker.mjs]
+    environment:
+      <<: *agent-env
+      SERVICE_ROLE: worker
 
 networks:
   backend: { internal: true }
@@ -182,3 +230,5 @@ secrets:
   executor_password: { file: ./.secrets/executor_password }
   demo_password: { file: ./.secrets/demo_password }
   replicator_password: { file: ./.secrets/replicator_password }
+  credential_key: { file: ./.secrets/credential_key }
+  admin_token: { file: ./.secrets/admin_token }

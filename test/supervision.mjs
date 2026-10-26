@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { apiFetch as fetch } from "./api-client.mjs";
 const cwd = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const base = process.env.BASE_URL || "http://127.0.0.1:8090";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

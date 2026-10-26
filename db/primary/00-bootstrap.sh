@@ -1,12 +1,10 @@
 #!/bin/sh
 set -eu
-monitor_password="$(cat /run/secrets/monitor_password)"
-executor_password="$(cat /run/secrets/executor_password)"
-demo_password="$(cat /run/secrets/demo_password)"
-replicator_password="$(cat /run/secrets/replicator_password)"
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
- --set=monitor_password="$monitor_password" --set=executor_password="$executor_password" \
- --set=demo_password="$demo_password" --set=replicator_password="$replicator_password" <<'SQL'
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'SQL'
+\set monitor_password `cat /run/verdant-postgres/monitor_password`
+\set executor_password `cat /run/verdant-postgres/executor_password`
+\set demo_password `cat /run/verdant-postgres/demo_password`
+\set replicator_password `cat /run/verdant-postgres/replicator_password`
 SELECT format('CREATE ROLE verdant_monitor LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L', :'monitor_password') \gexec
 SELECT format('CREATE ROLE verdant_executor LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L', :'executor_password') \gexec
 SELECT format('CREATE ROLE verdant_demo LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L', :'demo_password') \gexec
@@ -23,4 +21,3 @@ REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 GRANT CONNECT ON DATABASE workload TO verdant_monitor, verdant_executor, verdant_demo;
 SQL
 printf '\nhost replication verdant_replicator all scram-sha-256\n' >> "$PGDATA/pg_hba.conf"
-unset monitor_password executor_password demo_password replicator_password

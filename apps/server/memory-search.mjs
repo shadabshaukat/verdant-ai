@@ -1,5 +1,5 @@
 import { db } from "./store.mjs";
-import { timestamp, errText } from "./config.mjs";
+import { timestamp, errText, ENV } from "./config.mjs";
 import { parseMemoryIntent } from "./memory-intent.mjs";
 import { buildMemorySearchQuery, SEMANTIC_THRESHOLD } from "./memory-query.mjs";
 import { EMBEDDING_MODEL, embedSearchQuery } from "./embeddings.mjs";
@@ -55,6 +55,7 @@ async function enrichResults(rows, intent) {
       [incidentIds, actionIds, eventIds, intent.from, intent.to],
     ),
   ]);
+  const clusterNames = new Map((await db.query("SELECT cluster_id,name FROM agent.fleet_cluster")).rows.map(cluster => [cluster.cluster_id, cluster.name]));
   return rows.map((row) => {
     const linkedActions = actions.rows.filter((a) =>
       actionDirectlyLinked(row, a, intent),
@@ -65,6 +66,7 @@ async function enrichResults(rows, intent) {
     const incident = incidents.rows.find(
       (i) => i.incident_id === row.incident_id,
     );
+    const clusterId = row.metadata?.clusterId || (incident?.target_id?.startsWith("fleet:") ? incident.target_id.split(":")[1] : "demo");
     const sql = [];
     extractSqlEvidence(
       row.metadata?.snapshot,
@@ -97,6 +99,8 @@ async function enrichResults(rows, intent) {
       id: row.id,
       sourceType: row.source_type,
       sourceId: row.source_id,
+      clusterId,
+      clusterName: clusterId === "demo" ? "Demo" : clusterNames.get(clusterId) || "Archived cluster",
       at: timestamp(row.occurred_at),
       kind: row.kind,
       category: row.category,
@@ -227,18 +231,13 @@ export async function searchMemory(body) {
 export async function semanticRecallMemories(incidents, limit = 4) {
   if (!incidents.length) return [];
   try {
-    const vector = await Promise.race([
-      embedSearchQuery(incidents.map((i) => i.kind + " " + i.title).join("; ")),
-      new Promise((_, reject) =>
-        setTimeout(
-          () => reject(new Error("Semantic recall budget exceeded")),
-          1200,
-        ),
-      ),
-    ]);
+    const vector = await embedSearchQuery(
+      incidents.map((i) => i.kind + " " + i.title).join("; "),
+      { timeoutMs: ENV.semanticRecallTimeoutMs },
+    );
     return (
       await db.query(
-        `SELECT m.* FROM agent.search_document d JOIN agent.memory m ON m.memory_id::text=d.source_id WHERE d.source_type='memory' AND d.embedding_model=$1 AND d.embedding IS NOT NULL AND (1-(d.embedding<=>$2::public.vector))>=$3 ORDER BY CASE WHEN m.kind IN ('human_feedback','human_directive') THEN 0 ELSE 1 END,d.embedding<=>$2::public.vector LIMIT $4`,
+        `SELECT m.* FROM agent.search_document d JOIN agent.memory m ON m.memory_id::text=d.source_id LEFT JOIN agent.incident i ON i.incident_id=m.incident_id WHERE d.source_type='memory' AND d.embedding_model=$1 AND d.embedding IS NOT NULL AND (i.target_id IN ('primary','standby') OR (m.incident_id IS NULL AND coalesce(m.metadata->>'scope','')<>'fleet')) AND (1-(d.embedding<=>$2::public.vector))>=$3 ORDER BY CASE WHEN m.kind IN ('human_feedback','human_directive') THEN 0 ELSE 1 END,d.embedding<=>$2::public.vector LIMIT $4`,
         [EMBEDDING_MODEL, JSON.stringify(vector), SEMANTIC_THRESHOLD, limit],
       )
     ).rows;

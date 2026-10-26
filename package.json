@@ -1,19 +1,51 @@
 {
   "name": "verdant-dba",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
-  "description": "A supervised autonomous PostgreSQL DBA agent for a disposable local database lab",
+  "description": "An autonomous PostgreSQL operations agent with durable memory, human supervision and hybrid event retrieval",
   "engines": {
     "node": ">=22"
   },
   "scripts": {
-    "start": "node apps/server/server.mjs",
+    "setup": "node scripts/verdant.mjs setup",
+    "start": "node scripts/verdant.mjs start",
+    "stop": "node scripts/verdant.mjs stop",
+    "status": "node scripts/verdant.mjs status",
+    "logs": "node scripts/verdant.mjs logs",
+    "doctor": "node scripts/verdant.mjs doctor",
+    "models": "node scripts/verdant.mjs models",
+    "migrate": "node scripts/verdant.mjs migrate",
+    "serve": "node apps/server/server.mjs",
     "worker": "node apps/server/worker.mjs",
-    "test": "node --test test/core*.mjs",
-    "integration": "node test/integration.mjs"
+    "test": "node test/run-unit.mjs",
+    "check": "node scripts/check.mjs",
+    "integration": "node test/integration.mjs",
+    "integration:full": "node test/integration.mjs --full",
+    "integration:fleet": "node test/integration-fleet.mjs",
+    "integration:maintenance": "node test/integration-fleet-maintenance.mjs"
   },
   "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "3.1156.0",
+    "oci-common": "2.144.0",
+    "oci-generativeaiinference": "2.144.0",
     "pg": "8.16.3"
-  }
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shadabshaukat/verdant-ai.git"
+  },
+  "homepage": "https://github.com/shadabshaukat/verdant-ai#readme",
+  "bugs": {
+    "url": "https://github.com/shadabshaukat/verdant-ai/issues"
+  },
+  "keywords": [
+    "postgresql",
+    "ai-agent",
+    "database-operations",
+    "pgvector",
+    "observability",
+    "human-in-the-loop"
+  ]
 }

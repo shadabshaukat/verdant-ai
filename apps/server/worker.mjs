@@ -1,8 +1,18 @@
-import { startMemoryIndexer } from "./memory-index.mjs";
+import {
+  createTaskTracker,
+  drainWithin,
+  shutdownController,
+} from "./lifecycle.mjs";
+import { startMemoryIndexer, pendingMemoryIndex } from "./memory-index.mjs";
 import { exclusiveTask } from "./control-flow.mjs";
-process.env.SERVICE_ROLE = "worker";
-import { randomUUID } from "node:crypto";
-import { MODEL, closePools, errText } from "./config.mjs";
+import {
+  MODEL,
+  closePools,
+  errText,
+  ENV,
+  WORKER_ID,
+  DEMO_ENABLED,
+} from "./config.mjs";
 import {
   db,
   policy,
@@ -11,18 +21,29 @@ import {
   lease,
   newRun,
   finishRun,
+  initializePolicyDefaults,
 } from "./store.mjs";
 import { collect, persistDetections } from "./monitor.mjs";
 import { executeQueued } from "./actions.mjs";
 import { investigate } from "./planner.mjs";
-const owner = process.env.HOSTNAME || "worker-" + randomUUID();
-process.env.HOSTNAME = owner;
+import { collectFleet } from "./fleet.mjs";
+import { closeFleetConnections } from "./fleet-sensors.mjs";
+import { investigateFleetFindings } from "./fleet-planner.mjs";
+const owner = WORKER_ID;
+const tasks = createTaskTracker();
+let timer = null,
+  stopMemoryIndexer = () => {},
+  heartbeatDue = 0;
 let stopping = false,
   leader = false,
   monitorBusy = false,
   plannerBusy = false,
-  actionBusy = false;
-let monitorDue = 0,
+  actionBusy = false,
+  fleetBusy = false,
+  fleetPlannerBusy = false;
+let fleetDue = 0,
+  fleetPlannerDue = 0,
+  monitorDue = 0,
   leaseDue = 0,
   lastPlan = 0,
   cycleCount = 0,
@@ -31,7 +52,7 @@ let monitorDue = 0,
   forcePlanPending = false;
 const startedAt = new Date().toISOString();
 async function monitorCycle() {
-  if (monitorBusy || !leader || stopping) return;
+  if (!DEMO_ENABLED || monitorBusy || !leader || stopping) return;
   monitorBusy = true;
   try {
     const p = await policy();
@@ -78,7 +99,8 @@ async function monitorCycle() {
 }
 const plannerCycle = exclusiveTask(
   async (force = false) => {
-    if (!leader || stopping || Date.now() - lastPlan < 5000) return;
+    if (!DEMO_ENABLED || !leader || stopping || Date.now() - lastPlan < 5000)
+      return;
     plannerBusy = true;
     let run = null;
     let attempted = false;
@@ -87,7 +109,7 @@ const plannerCycle = exclusiveTask(
       if (p.paused) return;
       const candidates = (
         await db.query(
-          `SELECT i.incident_id FROM agent.incident i WHERE i.status='open' AND NOT EXISTS(SELECT 1 FROM agent.action a WHERE a.incident_id=i.incident_id AND a.generation=i.generation) AND NOT EXISTS(SELECT 1 FROM agent.review r WHERE r.incident_id=i.incident_id AND r.generation=i.generation AND r.review_type='investigation' AND r.status='pending') LIMIT 1`,
+          `SELECT i.incident_id FROM agent.incident i WHERE i.target_id IN ('primary','standby') AND i.status='open' AND NOT EXISTS(SELECT 1 FROM agent.action a WHERE a.incident_id=i.incident_id AND a.generation=i.generation) AND NOT EXISTS(SELECT 1 FROM agent.review r WHERE r.incident_id=i.incident_id AND r.generation=i.generation AND r.review_type='investigation' AND r.status='pending') LIMIT 1`,
         )
       ).rows;
       if (!candidates.length && !force) return;
@@ -99,11 +121,13 @@ const plannerCycle = exclusiveTask(
       lastPlanner = result.planner;
       await finishRun(
         run.run_id,
-        result.error
-          ? "degraded"
-          : result.restartRequested
-            ? "steered"
-            : "completed",
+        result.interrupted
+          ? "interrupted"
+          : result.error
+            ? "degraded"
+            : result.restartRequested
+              ? "steered"
+              : "completed",
         result.summary,
         result.planner,
         result.model || MODEL,
@@ -151,7 +175,7 @@ const plannerCycle = exclusiveTask(
     ),
 );
 async function actionCycle() {
-  if (actionBusy || plannerBusy || !leader || stopping) return;
+  if (!DEMO_ENABLED || actionBusy || plannerBusy || !leader || stopping) return;
   actionBusy = true;
   try {
     await executeQueued();
@@ -163,15 +187,53 @@ async function actionCycle() {
     actionBusy = false;
   }
 }
+async function fleetCycle() {
+  if (fleetBusy || !leader || stopping) return;
+  fleetBusy = true;
+  try {
+    await collectFleet();
+  } catch (error) {
+    console.error(
+      JSON.stringify({ component: "fleet-monitor", error: errText(error) }),
+    );
+  } finally {
+    fleetBusy = false;
+    fleetDue = Date.now() + 5000;
+  }
+}
+async function fleetPlannerCycle() {
+  if (fleetPlannerBusy || !leader || stopping) return;
+  fleetPlannerBusy = true;
+  try {
+    const p = await policy();
+    if (!p.paused) await investigateFleetFindings();
+  } catch (error) {
+    console.error(
+      JSON.stringify({ component: "fleet-planner", error: errText(error) }),
+    );
+  } finally {
+    fleetPlannerBusy = false;
+    fleetPlannerDue = Date.now() + 15000;
+  }
+}
 async function tick() {
   if (stopping) return;
   try {
     if (Date.now() > leaseDue) {
+      const wasLeader = leader;
       leader = !!(await lease(owner));
       leaseDue = Date.now() + 30000;
+      if (leader && !wasLeader) await activateLeader();
       if (!leader) return;
     }
     if (!leader) return;
+    if (Date.now() > heartbeatDue) {
+      await db.query(
+        "UPDATE agent.runtime SET heartbeat_at=now() WHERE singleton AND state->>'workerId'=$1 AND EXISTS(SELECT 1 FROM agent.lease WHERE lease_key='worker' AND owner=$1 AND expires_at>now())",
+        [owner],
+      );
+      heartbeatDue = Date.now() + 10000;
+    }
     const rt = (
       await db.query(
         "SELECT cycle_requested_at FROM agent.runtime WHERE singleton",
@@ -186,18 +248,23 @@ async function tick() {
       monitorDue = 0;
       forcePlanPending = true;
     }
-    if (Date.now() > monitorDue) void monitorCycle();
-    void actionCycle();
-    if (!monitorBusy) void plannerCycle(forcePlanPending);
+    if (Date.now() > fleetDue) void tasks.run(fleetCycle);
+    if (Date.now() > fleetPlannerDue) void tasks.run(fleetPlannerCycle);
+    if (DEMO_ENABLED) {
+      if (Date.now() > monitorDue) void tasks.run(monitorCycle);
+      void tasks.run(actionCycle);
+      if (!monitorBusy) void tasks.run(() => plannerCycle(forcePlanPending));
+    }
   } catch (e) {
     console.error(
       JSON.stringify({ component: "scheduler", error: errText(e) }),
     );
   }
 }
-leader = !!(await lease(owner));
-leaseDue = Date.now() + 30000;
-if (leader) {
+async function activateLeader() {
+  if (stopping) return;
+  await initializePolicyDefaults();
+  if (stopping) return;
   await db.query(
     `UPDATE agent.run SET status='interrupted',completed_at=now(),summary='Worker restarted; durable action attempts remain eligible for guarded recovery.' WHERE status='running'`,
   );
@@ -206,24 +273,72 @@ if (leader) {
     model: MODEL,
     monitoringIndependentOfPlanner: true,
   });
-  await runtime({ status: "watching", startedAt, model: MODEL });
+  await runtime({
+    status: "watching",
+    workerStatus: "running",
+    workerId: owner,
+    startedAt,
+    model: MODEL,
+  });
 }
-const stopMemoryIndexer = startMemoryIndexer(() => leader && !stopping);
-const timer = setInterval(tick, 1000);
-await tick();
-async function stop() {
+async function stop(exitCode = 0) {
   if (stopping) return;
   stopping = true;
+  leader = false;
   clearInterval(timer);
   stopMemoryIndexer();
-  await db
-    .query(
-      `UPDATE agent.lease SET expires_at=now() WHERE lease_key='worker' AND owner=$1`,
-      [owner],
-    )
-    .catch(() => {});
-  await closePools();
-  process.exit(0);
+  void closeFleetConnections();
+  shutdownController.abort(new Error("Worker is stopping"));
+  const cleanup = (async () => {
+    await Promise.allSettled([...tasks.pending(), ...pendingMemoryIndex()]);
+    await db
+      .query(
+        `UPDATE agent.runtime SET state=state||'{"workerStatus":"stopped","status":"stopped"}'::jsonb,heartbeat_at=now() WHERE singleton AND state->>'workerId'=$1`,
+        [owner],
+      )
+      .catch(() => {});
+    await db
+      .query(
+        "UPDATE agent.lease SET expires_at=now() WHERE lease_key='worker' AND owner=$1",
+        [owner],
+      )
+      .catch(() => {});
+    await closePools();
+  })();
+  const drained = await drainWithin([cleanup], ENV.shutdownTimeoutMs);
+  if (!drained)
+    console.error(
+      JSON.stringify({
+        component: "worker",
+        error:
+          "Shutdown deadline reached. Durable in-flight attempts remain eligible for guarded recovery.",
+      }),
+    );
+  process.exit(drained ? exitCode : 1);
 }
-process.on("SIGTERM", stop);
-process.on("SIGINT", stop);
+process.once("SIGTERM", () => void stop());
+process.once("SIGINT", () => void stop());
+const scheduler = exclusiveTask(tick, (error) =>
+  console.error(
+    JSON.stringify({ component: "scheduler", error: errText(error) }),
+  ),
+);
+try {
+  await tasks.run(async () => {
+    leader = !!(await lease(owner));
+    leaseDue = Date.now() + 30000;
+    if (leader) await activateLeader();
+    if (!stopping) {
+      stopMemoryIndexer = startMemoryIndexer(() => leader && !stopping);
+      timer = setInterval(() => void tasks.run(scheduler), 1000);
+      await tasks.run(scheduler);
+    }
+  });
+} catch (error) {
+  if (!stopping) {
+    console.error(
+      JSON.stringify({ component: "worker-startup", error: errText(error) }),
+    );
+    await stop(1);
+  }
+}

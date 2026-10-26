@@ -1,5 +1,10 @@
 .secrets/
 node_modules/
 .env
+.env.*
+!.env.example
 *.log
+*.dump
+backups/
+coverage/
 .DS_Store

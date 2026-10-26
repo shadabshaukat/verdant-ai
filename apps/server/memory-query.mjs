@@ -15,6 +15,9 @@ export function buildMemorySearchQuery(intent, vector, model) {
       AND ($3::text IS NULL OR d.source_type=$3)
       AND (cardinality($4::text[])=0 OR d.category=ANY($4::text[]) OR d.metadata->>'relatedCategory'=ANY($4::text[]))
       AND NOT EXISTS(SELECT 1 FROM unnest($5::text[]) term WHERE strpos(lower(d.title||' '||d.content),lower(term))=0)
+      AND ($13::text IS NULL OR
+        ($13='demo' AND coalesce(d.metadata->>'clusterId','demo')='demo' AND NOT EXISTS(SELECT 1 FROM agent.incident ci WHERE ci.incident_id=d.incident_id AND ci.target_id NOT IN ('primary','standby'))) OR
+        d.metadata->>'clusterId'=$13 OR EXISTS(SELECT 1 FROM agent.incident ci JOIN agent.target ct USING(target_id) WHERE ci.incident_id=d.incident_id AND ct.metadata->>'clusterId'=$13))
   ), matching AS MATERIALIZED (
     SELECT * FROM filtered WHERE $9::boolean OR keyword_score>0 OR semantic_similarity >= $12 OR ($6::text='' AND $7::text IS NULL)
   ), ranked AS (
@@ -38,6 +41,7 @@ export function buildMemorySearchQuery(intent, vector, model) {
       intent.limit,
       intent.offset,
       SEMANTIC_THRESHOLD,
+      intent.clusterId || null,
     ],
   };
 }

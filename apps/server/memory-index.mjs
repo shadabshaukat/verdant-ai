@@ -1,21 +1,17 @@
 import { db } from "./store.mjs";
 import { EMBEDDING_MODEL, embedTexts } from "./embeddings.mjs";
 import { sourceDocument } from "./memory-documents.mjs";
-import { errText } from "./config.mjs";
-const boundedEnv = (name, fallback, max) =>
-  Math.max(
-    1,
-    Math.min(max, Number.parseInt(process.env[name], 10) || fallback),
-  );
-const BATCH = boundedEnv("MEMORY_INDEX_BATCH_SIZE", 100, 500),
-  EMBED_BATCH = boundedEnv("MEMORY_EMBED_BATCH_SIZE", 8, 64);
-const QUERY_ROWS = `SELECT o.observation_id,o.recorded_at,q.value AS query,q.ordinality FROM agent.observation o CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(o.payload->'queries'->'queries')='array' THEN o.payload->'queries'->'queries' ELSE '[]'::jsonb END) WITH ORDINALITY q(value,ordinality) WHERE o.target_id='primary' AND q.value->>'query' ILIKE '%app.orders%' AND q.value->>'query' NOT ILIKE '%EXPLAIN%' AND q.value->>'query' NOT ILIKE '%pg_stat_%'`;
+import { errText, ENV } from "./config.mjs";
+import { createTaskTracker } from "./lifecycle.mjs";
+const BATCH = ENV.memoryIndexBatchSize,
+  EMBED_BATCH = ENV.memoryEmbedBatchSize;
+const QUERY_ROWS = `SELECT o.observation_id,o.target_id,t.metadata->>'clusterId' AS cluster_id,o.recorded_at,q.value AS query,q.ordinality FROM agent.observation o JOIN agent.target t USING(target_id) CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(o.payload->'queries'->'queries')='array' THEN o.payload->'queries'->'queries' ELSE '[]'::jsonb END) WITH ORDINALITY q(value,ordinality) WHERE (o.target_id='primary' OR o.target_id LIKE 'fleet:%')`;
 const SOURCES = {
-  memory: `SELECT m.*,i.kind AS incident_kind FROM agent.memory m LEFT JOIN agent.incident i USING(incident_id) LEFT JOIN agent.search_document d ON d.source_type='memory' AND d.source_id=m.memory_id::text WHERE d.id IS NULL OR d.metadata->>'indexVersion' IS DISTINCT FROM 'hybrid-full-1' ORDER BY m.created_at,m.memory_id LIMIT $1`,
-  event: `SELECT e.*,i.kind AS incident_kind,a.tool AS action_tool,a.sql_template,a.incident_id AS linked_incident_id FROM agent.event e LEFT JOIN agent.action a USING(action_id) LEFT JOIN agent.incident i ON i.incident_id=coalesce(e.incident_id,a.incident_id) LEFT JOIN agent.search_document d ON d.source_type='event' AND d.source_id=e.event_id::text WHERE d.id IS NULL OR d.metadata->>'indexVersion' IS DISTINCT FROM 'hybrid-full-1' ORDER BY e.event_id LIMIT $1`,
-  incident: `SELECT i.*,coalesce((SELECT min(e.recorded_at) FROM agent.event e WHERE e.incident_id=i.incident_id AND e.event_type='incident.reopened' AND e.detail->>'generation'=i.generation::text),i.first_seen_at) AS generation_seen_at,md5((to_jsonb(i)-'last_seen_at')::text) AS source_hash FROM agent.incident i LEFT JOIN agent.search_document d ON d.source_type='incident' AND d.source_id=i.incident_id::text||':'||i.generation::text WHERE d.id IS NULL OR d.metadata->>'indexVersion' IS DISTINCT FROM 'hybrid-full-1' OR d.metadata->>'sourceHash' IS DISTINCT FROM md5((to_jsonb(i)-'last_seen_at')::text) ORDER BY (d.id IS NULL) DESC,i.first_seen_at LIMIT $1`,
-  action: `SELECT a.*,i.kind AS incident_kind,md5(to_jsonb(a)::text) AS source_hash FROM agent.action a JOIN agent.incident i USING(incident_id) LEFT JOIN agent.search_document d ON d.source_type='action' AND d.source_id=a.action_id::text WHERE d.id IS NULL OR d.metadata->>'indexVersion' IS DISTINCT FROM 'hybrid-full-1' OR d.metadata->>'sourceHash' IS DISTINCT FROM md5(to_jsonb(a)::text) ORDER BY (d.id IS NULL) DESC,a.created_at LIMIT $1`,
-  query: `SELECT q.* FROM (${QUERY_ROWS}) q LEFT JOIN agent.search_document d ON d.source_type='query' AND d.source_id=q.observation_id::text||':'||q.ordinality::text WHERE d.id IS NULL OR d.metadata->>'indexVersion' IS DISTINCT FROM 'hybrid-full-1' ORDER BY q.observation_id,q.ordinality LIMIT $1`,
+  memory: `SELECT m.*,i.kind AS incident_kind,i.target_id,t.metadata->>'clusterId' AS cluster_id FROM agent.memory m LEFT JOIN agent.incident i USING(incident_id) LEFT JOIN agent.target t ON t.target_id=i.target_id LEFT JOIN agent.search_document d ON d.source_type='memory' AND d.source_id=m.memory_id::text WHERE d.id IS NULL OR d.metadata->>'indexVersion' IS DISTINCT FROM 'hybrid-fleet-2' ORDER BY m.created_at,m.memory_id LIMIT $1`,
+  event: `SELECT e.*,i.kind AS incident_kind,i.target_id,t.metadata->>'clusterId' AS cluster_id,a.tool AS action_tool,a.sql_template,a.incident_id AS linked_incident_id FROM agent.event e LEFT JOIN agent.action a USING(action_id) LEFT JOIN agent.incident i ON i.incident_id=coalesce(e.incident_id,a.incident_id) LEFT JOIN agent.target t ON t.target_id=i.target_id LEFT JOIN agent.search_document d ON d.source_type='event' AND d.source_id=e.event_id::text WHERE d.id IS NULL OR d.metadata->>'indexVersion' IS DISTINCT FROM 'hybrid-fleet-2' ORDER BY e.event_id LIMIT $1`,
+  incident: `SELECT i.*,t.metadata->>'clusterId' AS cluster_id,coalesce((SELECT min(e.recorded_at) FROM agent.event e WHERE e.incident_id=i.incident_id AND e.event_type='incident.reopened' AND e.detail->>'generation'=i.generation::text),i.first_seen_at) AS generation_seen_at,md5((to_jsonb(i)-'last_seen_at')::text) AS source_hash FROM agent.incident i JOIN agent.target t USING(target_id) LEFT JOIN agent.search_document d ON d.source_type='incident' AND d.source_id=i.incident_id::text||':'||i.generation::text WHERE d.id IS NULL OR d.metadata->>'indexVersion' IS DISTINCT FROM 'hybrid-fleet-2' OR d.metadata->>'sourceHash' IS DISTINCT FROM md5((to_jsonb(i)-'last_seen_at')::text) ORDER BY (d.id IS NULL) DESC,i.first_seen_at LIMIT $1`,
+  action: `SELECT a.*,i.kind AS incident_kind,t.metadata->>'clusterId' AS cluster_id,md5(to_jsonb(a)::text) AS source_hash FROM agent.action a JOIN agent.incident i USING(incident_id) JOIN agent.target t ON t.target_id=i.target_id LEFT JOIN agent.search_document d ON d.source_type='action' AND d.source_id=a.action_id::text WHERE d.id IS NULL OR d.metadata->>'indexVersion' IS DISTINCT FROM 'hybrid-fleet-2' OR d.metadata->>'sourceHash' IS DISTINCT FROM md5(to_jsonb(a)::text) ORDER BY (d.id IS NULL) DESC,a.created_at LIMIT $1`,
+  query: `SELECT q.* FROM (${QUERY_ROWS}) q LEFT JOIN agent.search_document d ON d.source_type='query' AND d.source_id=q.observation_id::text||':'||q.ordinality::text WHERE d.id IS NULL OR d.metadata->>'indexVersion' IS DISTINCT FROM 'hybrid-fleet-2' ORDER BY q.observation_id,q.ordinality LIMIT $1`,
 };
 async function upsertDocument(c, doc) {
   await c.query(
@@ -38,7 +34,7 @@ async function upsertDocument(c, doc) {
   );
 }
 let busy = false;
-export async function indexMemoryBatch({ embeddings = true } = {}) {
+async function performIndexBatch({ embeddings = true } = {}) {
   if (busy) return { skipped: true };
   busy = true;
   let c,
@@ -127,13 +123,18 @@ export async function indexMemoryBatch({ embeddings = true } = {}) {
     busy = false;
   }
 }
+const indexTasks = createTaskTracker();
+export function indexMemoryBatch(options) {
+  return indexTasks.run(() => performIndexBatch(options));
+}
+export const pendingMemoryIndex = () => indexTasks.pending();
 export function startMemoryIndexer(shouldRun = () => true) {
   const run = () => {
     if (shouldRun()) void indexMemoryBatch();
   };
   const startup = setTimeout(run, 250);
   startup.unref();
-  const timer = setInterval(run, 15000);
+  const timer = setInterval(run, ENV.memoryIndexIntervalMs);
   timer.unref();
   return () => {
     clearTimeout(startup);

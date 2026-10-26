@@ -8,18 +8,18 @@ export function categoryFor(kind = "", relatedKind = "") {
     /human_feedback|human_directive|human\.reviewed|human\.steering/.test(kind)
   )
     return "human_feedback";
-  const text = kind + " " + relatedKind;
+  const text = kind + " " + relatedKind + " " + (kind + " " + relatedKind).replaceAll("_", "-");
   if (
-    /stale-statistics|query-tuning|blocked-query|analyze_table|create_demo_index|cancel_demo_blocker|inspect_queries|inspect_statistics|inspect_blockers/.test(
+    /stale-statistics|query-tuning|query-performance-concern|blocked-quer|analyze_table|create_demo_index|cancel_demo_blocker|inspect_queries|inspect_statistics|inspect_blockers|connection-pressure|long-transaction|idle-transaction|deadlock|vacuum|table-bloat/.test(
       text,
     )
   )
     return "performance";
   if (/replicat|standby|resume_replication|inspect_replication/.test(text))
     return "replication";
-  if (/risky-role|restrict_demo_role|inspect_security/.test(text))
+  if (/risky-role|restrict_demo_role|inspect_security|security-posture|tls-posture/.test(text))
     return "security";
-  if (/target-unavailable/.test(text)) return "availability";
+  if (/target-unavailable|endpoint-unavailable/.test(text)) return "availability";
   if (
     /human_feedback|human_directive|human\.reviewed|human\.steering/.test(kind)
   )
@@ -50,20 +50,21 @@ export function extractSqlEvidence(
       ...(value.calls != null
         ? {
             calls: value.calls,
-            meanMs: value.mean_ms ?? null,
-            totalMs: value.total_ms ?? null,
+            meanMs: value.mean_ms ?? value.meanMs ?? null,
+            totalMs: value.total_ms ?? value.totalMs ?? null,
           }
         : {}),
     });
   for (const [key, child] of Object.entries(value)) {
     if (
-      ["sql", "sql_template"].includes(key) &&
+      ["sql", "sql_template", "sqlTemplate"].includes(key) &&
       typeof child === "string" &&
       child.trim()
     )
       output.push({
         query: child.slice(0, 4000),
         queryId: null,
+        ...(Array.isArray(value.parameters) ? { parameters: value.parameters } : {}),
         at,
         provenance: reference + ":" + path + key,
         scope:
@@ -182,7 +183,7 @@ export function sourceDocument(type, row) {
     sourceId = row.observation_id + ":" + row.ordinality;
     at = row.recorded_at;
     kind = "query-statistics-snapshot";
-    queryId = String(row.query.queryid || "");
+    queryId = String(row.query.queryid || row.query.queryId || "");
     title = "Observed SQL fingerprint " + (queryId || "without identifier");
     snapshot = { query: row.query, observationId: String(row.observation_id) };
     content =
@@ -209,7 +210,9 @@ export function sourceDocument(type, row) {
     eventId,
     queryId,
     metadata: {
-      indexVersion: "hybrid-full-1",
+      indexVersion: "hybrid-fleet-2",
+      clusterId: row.cluster_id || row.metadata?.clusterId || row.detail?.clusterId || null,
+      targetId: row.target_id || null,
       snapshot,
       relatedCategory: categoryFor(
         "",

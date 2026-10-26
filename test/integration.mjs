@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { apiFetch as fetch } from "./api-client.mjs";
 const cwd = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const base = process.env.BASE_URL || "http://127.0.0.1:8090";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -54,7 +55,21 @@ async function until(fn, timeout = 20000) {
   throw new Error("Condition did not become true within " + timeout + " ms");
 }
 console.log("Checking", base);
-await api("/healthz");
+const readiness = await api("/healthz");
+assert.equal(readiness.status, "ready");
+assert.equal(readiness.control, "ready");
+assert.ok(
+  readiness.worker?.status,
+  "Readiness should report worker health separately",
+);
+for (const invalid of ["null", "[]", "1"]) {
+  const rejected = await fetch(base + "/api/agent/control", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: invalid,
+  });
+  assert.equal(rejected.status, 400, "Mutation requests must be JSON objects");
+}
 assert.equal(sql("primary", "SELECT pg_is_in_recovery()"), "f");
 assert.equal(sql("standby", "SELECT pg_is_in_recovery()"), "t");
 assert.equal(

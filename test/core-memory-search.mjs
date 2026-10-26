@@ -77,6 +77,16 @@ test("hard filter values are bound parameters and cannot modify the SQL query st
   assert.match(q.text, /count\(\*\).*FROM scored/);
   assert.equal(q.text.includes("LIMIT 200"), false);
 });
+
+test("cluster scope is a mandatory bound filter for structured and semantic memory search", () => {
+  const id = "11111111-1111-4111-8111-111111111111";
+  const intent = parseMemoryIntent({ query: "all performance events", clusterId: id });
+  const query = buildMemorySearchQuery(intent, null, "model-one");
+  assert.equal(query.values[12], id);
+  assert.equal(query.text.includes(id), false);
+  assert.match(query.text, /clusterId/);
+  assert.throws(() => parseMemoryIntent({ clusterId: "primary OR true" }), /clusterId/);
+});
 test("an old event without a known generation cannot inherit SQL from later actions", () => {
   const doc = {
     source_type: "event",

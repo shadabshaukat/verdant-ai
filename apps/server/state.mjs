@@ -1,3 +1,4 @@
+import { workerHealth } from "./lifecycle.mjs";
 import { db, policy, mapReview } from "./store.mjs";
 import { timestamp, asNumber, MODEL, DEMO_ENABLED } from "./config.mjs";
 import { fixtureInfo } from "./fixtures.mjs";
@@ -10,15 +11,15 @@ export async function getState() {
         `SELECT DISTINCT ON(target_id) target_id,recorded_at,payload FROM agent.observation ORDER BY target_id,recorded_at DESC`,
       ),
       db.query(
-        "SELECT * FROM agent.incident ORDER BY last_seen_at DESC LIMIT 60",
+        "SELECT * FROM agent.incident WHERE target_id IN ('primary','standby') ORDER BY last_seen_at DESC LIMIT 60",
       ),
-      db.query("SELECT * FROM agent.action ORDER BY created_at DESC LIMIT 60"),
-      db.query("SELECT * FROM agent.review ORDER BY created_at DESC LIMIT 80"),
-      db.query("SELECT * FROM agent.event ORDER BY event_id DESC LIMIT 120"),
-      db.query("SELECT * FROM agent.memory ORDER BY created_at DESC LIMIT 60"),
-      db.query("SELECT * FROM agent.run ORDER BY started_at DESC LIMIT 20"),
+      db.query("SELECT * FROM agent.action WHERE target_id IN ('primary','standby') ORDER BY created_at DESC LIMIT 60"),
+      db.query("SELECT r.* FROM agent.review r LEFT JOIN agent.incident i USING(incident_id) WHERE (i.target_id IN ('primary','standby') OR r.incident_id IS NULL) AND coalesce(r.proposed_action->>'scope','')<>'fleet' ORDER BY r.created_at DESC LIMIT 80"),
+      db.query("SELECT e.* FROM agent.event e LEFT JOIN agent.incident i USING(incident_id) WHERE (i.target_id IN ('primary','standby') OR e.incident_id IS NULL) AND NOT(e.event_type LIKE 'fleet.%') ORDER BY e.event_id DESC LIMIT 120"),
+      db.query("SELECT m.* FROM agent.memory m LEFT JOIN agent.incident i USING(incident_id) WHERE (i.target_id IN ('primary','standby') OR m.incident_id IS NULL) AND coalesce(m.metadata->>'scope','')<>'fleet' ORDER BY m.created_at DESC LIMIT 60"),
+      db.query("SELECT * FROM agent.run WHERE cluster_id IS NULL ORDER BY started_at DESC LIMIT 20"),
       db.query(
-        `SELECT s.* FROM agent.step s JOIN (SELECT run_id FROM agent.run ORDER BY started_at DESC LIMIT 20) r USING(run_id) ORDER BY s.sequence`,
+        `SELECT s.* FROM agent.step s JOIN (SELECT run_id FROM agent.run WHERE cluster_id IS NULL ORDER BY started_at DESC LIMIT 20) r USING(run_id) ORDER BY s.sequence`,
       ),
       db.query(
         `SELECT target_id,recorded_at,payload FROM (SELECT *,row_number() OVER(PARTITION BY target_id ORDER BY recorded_at DESC) AS rn FROM agent.observation) o WHERE rn<=60 ORDER BY recorded_at`,
@@ -26,11 +27,10 @@ export async function getState() {
       db.query("SELECT * FROM agent.demo_fixture"),
     ]);
   const runtime = rt.rows[0] || {};
+  const activeProfile = (await db.query("SELECT provider,model FROM agent.model_profile WHERE active AND purpose='chat' LIMIT 1")).rows[0];
   const rs = runtime.state || {};
-  const lastAge = runtime.heartbeat_at
-    ? Date.now() - new Date(runtime.heartbeat_at).getTime()
-    : Infinity;
-  const stale = lastAge > 60000;
+  const health = workerHealth(runtime);
+  const stale = health.status !== "healthy";
   const topology = ["primary", "standby"].map(
     (id) =>
       obs.rows.find((o) => o.target_id === id)?.payload || {
@@ -102,7 +102,8 @@ export async function getState() {
           : rs.status || "watching",
       mode: "guarded",
       planner: rs.planner || "monitor",
-      model: MODEL,
+      model: activeProfile?.model || MODEL,
+      provider: activeProfile?.provider || "ollama",
       intervalSeconds: p.monitorIntervalSeconds,
       lastCycleAt: rs.lastCycleAt || null,
       nextCycleAt: rs.nextCycleAt || null,
@@ -111,7 +112,8 @@ export async function getState() {
       uptimeSeconds: rs.startedAt
         ? Math.floor((Date.now() - new Date(rs.startedAt)) / 1000)
         : 0,
-      workerHeartbeatAt: timestamp(runtime.heartbeat_at),
+      workerHeartbeatAt: health.heartbeatAt,
+      workerStatus: health.status,
       error: rs.error || null,
     },
     topology,
@@ -250,7 +252,8 @@ export async function getSchema() {
     memory: "Searchable outcomes and human feedback recalled in later cycles",
     lease: "Single-worker lease and fencing generation",
     demo_fixture: "Scenario injection state",
-    search_document: "Hybrid search over events, outcomes, SQL evidence and memory",
+    search_document:
+      "Hybrid search over events, outcomes, SQL evidence and memory",
   };
   const tableNames = [...new Set(cols.map((c) => c.table_name))];
   return {
@@ -259,7 +262,10 @@ export async function getSchema() {
     columnCount: cols.length,
     tables: tableNames.map((name) => ({
       name: "agent." + name,
-      purpose: purposes[name] || cols.find((c) => c.table_name === name)?.table_description || "Durable agent state",
+      purpose:
+        purposes[name] ||
+        cols.find((c) => c.table_name === name)?.table_description ||
+        "Durable agent state",
       columns: cols
         .filter((c) => c.table_name === name)
         .map((c) => ({
@@ -269,12 +275,27 @@ export async function getSchema() {
           primaryKey: c.primary_key,
           default: c.generated_kind ? null : c.default_expression,
           generatedExpression: c.generated_kind ? c.default_expression : null,
-          identity: c.identity_kind === 'a' ? 'always' : c.identity_kind === 'd' ? 'by default' : null,
-          generated: c.generated_kind === 's' ? 'stored' : c.generated_kind === 'v' ? 'virtual' : null,
+          identity:
+            c.identity_kind === "a"
+              ? "always"
+              : c.identity_kind === "d"
+                ? "by default"
+                : null,
+          generated:
+            c.generated_kind === "s"
+              ? "stored"
+              : c.generated_kind === "v"
+                ? "virtual"
+                : null,
           description: c.description,
         })),
-      relations: constraints.rows.filter((r) => r.table_name === name)
-        .map((r) => ({ name: r.name, targetTable: r.target_table, definition: r.definition })),
+      relations: constraints.rows
+        .filter((r) => r.table_name === name)
+        .map((r) => ({
+          name: r.name,
+          targetTable: r.target_table,
+          definition: r.definition,
+        })),
     })),
   };
 }

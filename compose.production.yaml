@@ -1,0 +1,19 @@
+# Requires Docker Compose >= 2.24.4 for !override.
+# The production worker monitors GUI-registered clusters; local scenario databases stay disabled.
+services:
+  primary:
+    profiles: [demo]
+  standby:
+    profiles: [demo]
+  app:
+    environment:
+      DEMO_ENABLED: "false"
+    depends_on: !override
+      control: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+  worker:
+    environment:
+      DEMO_ENABLED: "false"
+    depends_on: !override
+      control: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }

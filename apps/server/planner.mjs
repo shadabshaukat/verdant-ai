@@ -1,10 +1,13 @@
+import { requestSignal, shutdownController } from "./lifecycle.mjs";
 import {
   EVIDENCE_RULES,
   historicalMemoryForPlanner,
   unverifiedModelSummary,
 } from "./planner-context.mjs";
 import { steeringChanged } from "./control-flow.mjs";
-import { MODEL, OLLAMA_URL, errText } from "./config.mjs";
+import { ENV, errText } from "./config.mjs";
+import { selectedChatProfile } from "./model-profiles.mjs";
+import { chatCompletion } from "./model-providers.mjs";
 import {
   db,
   activeIncidents,
@@ -119,8 +122,27 @@ const compact = (x) =>
   JSON.stringify(x, (_k, v) =>
     typeof v === "string" && v.length > 1800 ? v.slice(0, 1800) : v,
   ).slice(0, 22000);
+const legacyIncidents = async () =>
+  (await activeIncidents()).filter((incident) =>
+    ["primary", "standby"].includes(incident.target_id),
+  );
+async function legacyRecall(incidents) {
+  const rows = await recall(incidents);
+  const ids = rows.map((row) => row.incident_id).filter(Boolean);
+  const valid = new Set(
+    ids.length
+      ? (
+          await db.query(
+            "SELECT incident_id FROM agent.incident WHERE incident_id=ANY($1::uuid[]) AND target_id IN ('primary','standby')",
+            [ids],
+          )
+        ).rows.map((row) => row.incident_id)
+      : [],
+  );
+  return rows.filter((row) => !row.incident_id || valid.has(row.incident_id));
+}
 export async function investigate(runId) {
-  const incidents = await activeIncidents();
+  const incidents = await legacyIncidents();
   if (!incidents.length)
     return {
       planner: "monitor",
@@ -135,7 +157,33 @@ export async function investigate(runId) {
         "Monitoring continues. Human paused autonomous investigations and actions.",
       steps: 0,
     };
-  const memories = await recall(incidents);
+  let profile;
+  try {
+    profile = await selectedChatProfile();
+  } catch {
+    await event(
+      "planner.degraded",
+      "Selected chat profile could not be opened",
+      { monitoringContinues: true },
+      { runId, severity: "warning" },
+    );
+    for (const incident of incidents.slice(0, 3))
+      await reviewIncident(
+        incident,
+        "The selected model connection credentials could not be opened. Restore its credential key or review the profile; no alternate provider was silently selected.",
+        runId,
+      );
+    return {
+      planner: "fallback",
+      model: null,
+      summary:
+        "Monitoring continues; the selected model profile is unavailable. Human investigation queued.",
+      steps: 0,
+      error: "Selected model profile could not be opened",
+    };
+  }
+  const plannerProvider = profile.provider;
+  const memories = await legacyRecall(incidents);
   await db.query(
     "UPDATE agent.run SET recalled_memory_ids=$2 WHERE run_id=$1",
     [runId, memories.map((m) => m.memory_id)],
@@ -179,10 +227,25 @@ export async function investigate(runId) {
       }),
     },
   ];
-  await runtime({ status: "investigating", planner: "ollama", model: MODEL });
+  await db.query("UPDATE agent.run SET planner=$2,model=$3 WHERE run_id=$1", [
+    runId,
+    plannerProvider,
+    profile.model,
+  ]);
+  await runtime({
+    status: "investigating",
+    planner: plannerProvider,
+    model: profile.model,
+    modelProfileId: profile.id,
+  });
   try {
     for (let i = 0; i < 7; i++) {
       const freshPolicy = await readPolicy();
+      if (shutdownController.signal.aborted) {
+        lastSummary =
+          "Worker shutdown interrupted investigation before tool dispatch.";
+        break;
+      }
       if (freshPolicy.paused) {
         lastSummary = "Human paused autonomous actions during investigation.";
         break;
@@ -200,27 +263,34 @@ export async function investigate(runId) {
           (used.get(t.function.name) || 0) <
           (t.function.name.startsWith("inspect_") ? 2 : 4),
       );
-      const response = await fetch(OLLAMA_URL + "/api/chat", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          model: MODEL,
-          stream: false,
-          messages,
-          tools: available,
-          options: { temperature: 0, num_ctx: 12288, num_predict: 300 },
-          keep_alive: "30m",
-        }),
-        signal: AbortSignal.timeout(
-          Number(process.env.PLANNER_TIMEOUT_MS || 45000),
-        ),
+      const message = await chatCompletion(profile, {
+        messages,
+        tools: available,
+        contextTokens: ENV.plannerContextTokens,
+        maxTokens: ENV.plannerMaxTokens,
+        keepAlive: ENV.ollamaKeepAlive,
+        timeoutMs: ENV.plannerTimeoutMs,
+        signal: requestSignal(ENV.plannerTimeoutMs),
       });
-      if (!response.ok) throw new Error("Ollama HTTP " + response.status);
-      const payload = await response.json();
+      const currentProfile = await selectedChatProfile();
+      if (
+        currentProfile.id !== profile.id ||
+        currentProfile.revision !== profile.revision
+      ) {
+        lastSummary =
+          "The operator changed the active model profile; the old model decision was discarded.";
+        restartRequested = true;
+        break;
+      }
       const decision = parseDecision(
-        payload.message,
+        message,
         available.map((t) => t.function.name),
       );
+      if (shutdownController.signal.aborted) {
+        lastSummary =
+          "Worker shutdown discarded an undispatched model decision.";
+        break;
+      }
       const dispatchPolicy = await readPolicy();
       if (dispatchPolicy.paused || steeringChanged(p, dispatchPolicy)) {
         restartRequested = !dispatchPolicy.paused;
@@ -253,15 +323,16 @@ export async function investigate(runId) {
       } else if (decision.name === "recall_memory") {
         observation = {
           temporalScope: "Historical context only; fresh tool evidence wins.",
-          memories: (await recall(await activeIncidents())).map(
+          memories: (await legacyRecall(await legacyIncidents())).map(
             historicalMemoryForPlanner,
           ),
         };
       } else if (decision.name === "propose_action") {
         const incident = (
-          await db.query("SELECT * FROM agent.incident WHERE incident_id=$1", [
-            args.incidentId,
-          ])
+          await db.query(
+            "SELECT * FROM agent.incident WHERE incident_id=$1 AND target_id IN ('primary','standby')",
+            [args.incidentId],
+          )
         ).rows[0];
         await runtime({ status: "acting" });
         try {
@@ -271,6 +342,7 @@ export async function investigate(runId) {
             reason: args.reason,
             inspected,
             runId,
+            proposedBy: plannerProvider,
           });
         } catch (e) {
           observation = { status: "refused", error: errText(e) };
@@ -279,7 +351,7 @@ export async function investigate(runId) {
       } else if (decision.name === "request_human_review") {
         const incident = (
           await db.query(
-            "SELECT * FROM agent.incident WHERE incident_id=$1 AND status<>'resolved'",
+            "SELECT * FROM agent.incident WHERE incident_id=$1 AND status<>'resolved' AND target_id IN ('primary','standby')",
             [args.incidentId],
           )
         ).rows[0];
@@ -305,7 +377,7 @@ export async function investigate(runId) {
         runId,
         count,
         decision.name,
-        "ollama",
+        plannerProvider,
         decision.name === "finish_cycle"
           ? lastSummary
           : args.reason || "Model selected an evidence tool",
@@ -315,18 +387,28 @@ export async function investigate(runId) {
       await event(
         "agent.tool",
         decision.name,
-        { source: "ollama", arguments: args, observation },
+        {
+          source: plannerProvider,
+          modelProfileId: profile.id,
+          arguments: args,
+          observation,
+        },
         { runId },
       );
-      messages.push(payload.message, {
+      messages.push(message, {
         role: "tool",
         tool_name: decision.name,
+        tool_call_id: message.tool_calls[0]?.id,
         content: compact(observation),
       });
       if (decision.name === "finish_cycle") break;
     }
-    const unresolved = await activeIncidents();
-    if (!restartRequested && !(await readPolicy()).paused)
+    const unresolved = await legacyIncidents();
+    if (
+      !shutdownController.signal.aborted &&
+      !restartRequested &&
+      !(await readPolicy()).paused
+    )
       for (const i of unresolved) {
         const handled = (
           await db.query(
@@ -343,15 +425,25 @@ export async function investigate(runId) {
           );
       }
     return {
-      planner: "ollama",
-      model: MODEL,
+      planner: plannerProvider,
+      model: profile.model,
       summary: unresolved.length
         ? `Database evidence: ${unresolved.length} finding(s) remain unresolved. ${lastSummary}`
         : lastSummary,
       steps: count,
       restartRequested,
+      interrupted: shutdownController.signal.aborted,
     };
   } catch (e) {
+    if (shutdownController.signal.aborted)
+      return {
+        planner: plannerProvider,
+        model: profile.model,
+        summary:
+          "Worker shutdown interrupted model investigation; durable proposals remain available for recovery.",
+        steps: count,
+        interrupted: true,
+      };
     await step(
       runId,
       ++count,
@@ -367,7 +459,7 @@ export async function investigate(runId) {
       { error: errText(e), monitoringContinues: true },
       { runId, severity: "warning" },
     );
-    for (const incident of (await activeIncidents()).slice(0, 3))
+    for (const incident of (await legacyIncidents()).slice(0, 3))
       await reviewIncident(
         incident,
         "The model planner is unavailable or returned invalid output. Monitoring continues; no fallback planner executed a remediation.",
@@ -375,7 +467,7 @@ export async function investigate(runId) {
       );
     return {
       planner: "fallback",
-      model: MODEL,
+      model: profile.model,
       summary:
         "Monitoring continues; model planning is unavailable. Human investigation queued.",
       steps: count,

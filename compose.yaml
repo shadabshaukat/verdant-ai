@@ -1,0 +1,184 @@
+name: verdant-dba
+
+x-agent-env: &agent-env
+  PORT: "8090"
+  NODE_ENV: production
+  OLLAMA_URL: http://host.docker.internal:11434
+  OLLAMA_CHAT_MODEL: ${OLLAMA_MODEL:-qwen3:4b-instruct-2507-q4_K_M}
+  OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text:v1.5}
+  MONITOR_INTERVAL_SECONDS: ${MONITOR_INTERVAL_SECONDS:-15}
+  PLANNER_TIMEOUT_MS: ${PLANNER_TIMEOUT_MS:-45000}
+  DEMO_ENABLED: "true"
+
+x-agent-service: &agent-service
+  build: .
+  image: verdant-dba/app:1.1.1
+  entrypoint: ["/bin/sh", "/run-verdant-service.sh"]
+  environment: *agent-env
+  extra_hosts:
+    - host.docker.internal:host-gateway
+  secrets:
+    - control_password
+    - monitor_password
+    - executor_password
+    - demo_password
+  volumes:
+    - ./scripts/run-service.sh:/run-verdant-service.sh:ro
+  networks: [backend, frontend]
+  depends_on:
+    control: { condition: service_healthy }
+    primary: { condition: service_healthy }
+    standby: { condition: service_healthy }
+    migrate: { condition: service_completed_successfully }
+  restart: unless-stopped
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  logging:
+    driver: json-file
+    options: { max-size: 10m, max-file: "3" }
+
+services:
+  control:
+    build:
+      context: .
+      dockerfile: db/control/Dockerfile
+    image: verdant-dba/control:18.4-pgvector0.8.7
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: verdant
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    secrets: [postgres_password, control_password]
+    volumes:
+      - control_data:/var/lib/postgresql
+      - ./scripts/control-init.sh:/docker-entrypoint-initdb.d/00-control.sh:ro
+      - ./db/control:/control-schema:ro
+    networks: [backend]
+    healthcheck:
+      test:
+        [
+          CMD-SHELL,
+          'pg_isready -U postgres -d verdant && psql -U postgres -d verdant -Atqc "SELECT to_regnamespace(''agent'') IS NOT NULL" | grep -q t',
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  migrate:
+    image: verdant-dba/control:18.4-pgvector0.8.7
+    entrypoint: [/bin/sh, /control-migrate.sh]
+    secrets: [postgres_password]
+    volumes:
+      - ./scripts/control-migrate.sh:/control-migrate.sh:ro
+      - ./db/control:/control-schema:ro
+    networks: [backend]
+    depends_on:
+      control: { condition: service_healthy }
+    restart: "no"
+
+  primary:
+    image: postgres:18.4-bookworm
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: workload
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - compute_query_id=on
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=10
+      - -c
+      - hot_standby=on
+      - -c
+      - wal_keep_size=512MB
+    secrets:
+      [
+        postgres_password,
+        monitor_password,
+        executor_password,
+        demo_password,
+        replicator_password,
+      ]
+    volumes:
+      - primary_data:/var/lib/postgresql
+      - ./db/primary:/docker-entrypoint-initdb.d:ro
+    networks: [backend]
+    healthcheck:
+      test:
+        [
+          CMD-SHELL,
+          'pg_isready -U postgres -d workload && psql -U postgres -d workload -Atqc "SELECT to_regclass(''app.orders'') IS NOT NULL" | grep -q t',
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 10s
+    restart: unless-stopped
+
+  standby:
+    image: postgres:18.4-bookworm
+    environment:
+      PGDATA: /var/lib/postgresql/18/docker
+    entrypoint: [/bin/sh, /standby-entrypoint.sh]
+    secrets: [replicator_password]
+    volumes:
+      - standby_data:/var/lib/postgresql
+      - ./db/standby/entrypoint.sh:/standby-entrypoint.sh:ro
+    networks: [backend]
+    depends_on:
+      primary: { condition: service_healthy }
+    healthcheck:
+      test:
+        [
+          CMD-SHELL,
+          "pg_isready -U postgres -d workload && psql -U postgres -d workload -Atqc 'SELECT pg_is_in_recovery()' | grep -q t",
+        ]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 10s
+    restart: unless-stopped
+
+  app:
+    <<: *agent-service
+    command: [apps/server/server.mjs]
+    ports: ["127.0.0.1:${APP_PORT:-8090}:8090"]
+    healthcheck:
+      test:
+        [
+          CMD,
+          node,
+          -e,
+          "fetch('http://127.0.0.1:8090/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  worker:
+    <<: *agent-service
+    command: [apps/server/worker.mjs]
+
+networks:
+  backend: { internal: true }
+  frontend: {}
+volumes:
+  control_data:
+  primary_data:
+  standby_data:
+secrets:
+  postgres_password: { file: ./.secrets/postgres_password }
+  control_password: { file: ./.secrets/control_password }
+  monitor_password: { file: ./.secrets/monitor_password }
+  executor_password: { file: ./.secrets/executor_password }
+  demo_password: { file: ./.secrets/demo_password }
+  replicator_password: { file: ./.secrets/replicator_password }

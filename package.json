@@ -1,0 +1,19 @@
+{
+  "name": "verdant-dba",
+  "version": "1.1.1",
+  "private": true,
+  "type": "module",
+  "description": "A supervised autonomous PostgreSQL DBA agent for a disposable local database lab",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node apps/server/server.mjs",
+    "worker": "node apps/server/worker.mjs",
+    "test": "node --test test/core*.mjs",
+    "integration": "node test/integration.mjs"
+  },
+  "dependencies": {
+    "pg": "8.16.3"
+  }
+}

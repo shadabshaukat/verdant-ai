@@ -28,7 +28,7 @@
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "3.1156.0",
     "oci-common": "2.144.0",
-    "oci-generativeaiinference": "2.144.0",
+    "oci-generativeaiinference": "2.145.0",
     "pg": "8.16.3"
   },
   "license": "Apache-2.0",
